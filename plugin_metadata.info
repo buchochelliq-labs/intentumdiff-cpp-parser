@@ -1,0 +1,21 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+# Plugin code exposes this data; the host still owns trust and provenance.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-05-19
+
+[language.c]
+language_name = C
+language_short_name = C
+monaco_language = c
+default_filename = code.c
+language_file_extensions = 
+
+[language.cpp]
+language_name = C++
+language_short_name = C++
+monaco_language = cpp
+default_filename = code.cpp
+language_file_extensions = 
