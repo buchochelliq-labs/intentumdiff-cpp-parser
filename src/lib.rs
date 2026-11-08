@@ -4,11 +4,7 @@
 //! (C++ grammar) files. The plugin selects the appropriate Rust tree-sitter
 //! grammar itself; no Python CST serializer or Python grammar package is used.
 
-use intentumdiff_plugin_sdk::{
-    cst::CstNode,
-    hash::structural_hash_with_memo,
-    tree::{SemanticNode, SemanticNodeBuilder},
-};
+use intentumdiff_plugin_sdk::{cst::CstNode, tree::SemanticNode};
 
 wit_bindgen::generate!({
     path: "wit/plugin.wit",
@@ -98,6 +94,7 @@ const SEMANTIC_TYPES: &[&str] = &[
     "field_identifier",
     "namespace_identifier",
     "string_literal",
+    "char_literal",
     "number_literal",
     "true",
     "false",
@@ -233,9 +230,28 @@ fn convert(
     )
 }
 
-
-
 use intentumdiff_plugin_sdk::ts_convert::{convert_semantic_classed, node_to_cst};
+
+// C/C++ character prefixes are anonymous grammar tokens. Make the literal an
+// atomic value so shared leaf hashing includes every source byte (including
+// prefixes and escapes), rather than only the named children. Read the original
+// span to bypass the SDK's bounded display-text capture.
+fn normalize_character_literals(
+    node: &mut CstNode,
+    original: tree_sitter::Node<'_>,
+    source: &[u8],
+) {
+    if original.kind() == "char_literal" {
+        node.text = Some(original.utf8_text(source).unwrap_or("").to_string());
+        node.children.clear();
+        return;
+    }
+    for (index, child) in node.children.iter_mut().enumerate() {
+        if let Some(original_child) = original.named_child(index) {
+            normalize_character_literals(child, original_child, source);
+        }
+    }
+}
 
 fn is_c_language(language: &str, filename: &str) -> bool {
     let language = language.to_lowercase();
@@ -260,7 +276,8 @@ fn process_impl(source: &str, language: &str, filename: &str) -> String {
         Some(tree) => tree,
         None => return r#"{"error":"Parse failed"}"#.to_string(),
     };
-    let root = node_to_cst(tree.root_node(), source.as_bytes());
+    let mut root = node_to_cst(tree.root_node(), source.as_bytes());
+    normalize_character_literals(&mut root, tree.root_node(), source.as_bytes());
     let mut memo: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let sem = match convert(&root, "0", None, &mut memo) {
         Some(n) => n,
@@ -338,6 +355,107 @@ mod tests {
     use super::*;
     use crate::exports::intentdiff::plugin::parser::Guest;
     use intentumdiff_plugin_sdk::testing as t;
+
+    fn parse(source: &str, language: &str) -> SemanticNode {
+        serde_json::from_str(&process_impl(
+            source,
+            language,
+            if language == "c" {
+                "test.c"
+            } else {
+                "test.cpp"
+            },
+        ))
+        .unwrap()
+    }
+
+    fn literals(node: &SemanticNode) -> Vec<&SemanticNode> {
+        let mut found = Vec::new();
+        if node.node_type == "char_literal" {
+            found.push(node);
+        }
+        for child in &node.children {
+            found.extend(literals(child));
+        }
+        found
+    }
+
+    #[test]
+    fn character_literals_are_atomic_complete_and_byte_positioned() {
+        for language in ["c", "cpp"] {
+            for literal in [
+                "'a'", r"'\n'", r"'\''", r"'\x41'", "L'a'", "u'a'", "U'a'", "u8'a'", "U'λ'",
+            ] {
+                let source = format!("// λ\nint f() {{ return {literal}; }}\n");
+                let tree = parse(&source, language);
+                let found = literals(&tree);
+                assert_eq!(found.len(), 1, "{language}: {literal}");
+                let node = found[0];
+                assert_eq!(node.label, literal);
+                assert!(node.children.is_empty());
+                assert_eq!(node.position.start_line, 1);
+                assert_eq!(node.position.end_line, 1);
+                let line = source.lines().nth(1).unwrap();
+                assert_eq!(
+                    &line[node.position.start_col as usize..node.position.end_col as usize],
+                    literal
+                );
+                assert_eq!(
+                    serde_json::to_string(&tree).unwrap(),
+                    serde_json::to_string(&parse(&source, language)).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn character_literal_value_and_prefix_changes_change_hashes() {
+        for language in ["c", "cpp"] {
+            for (old, new) in [
+                ("'a'", "'b'"),
+                (r"'\n'", r"'\t'"),
+                ("'a'", "L'a'"),
+                ("u'a'", "U'a'"),
+                ("'a'", "u8'a'"),
+                ("U'λ'", "U'μ'"),
+            ] {
+                let old = parse(&format!("int f() {{ return {old}; }}"), language);
+                let new = parse(&format!("int f() {{ return {new}; }}"), language);
+                assert_ne!(old.structural_hash, new.structural_hash);
+                assert_ne!(
+                    literals(&old)[0].structural_hash,
+                    literals(&new)[0].structural_hash
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn character_literal_identity_and_formatting_preserve_hashes() {
+        for language in ["c", "cpp"] {
+            let old = parse("int f() { return L'λ'; }", language);
+            let same = parse("int f() { return L'λ'; }", language);
+            let formatted = parse("int f()\n{\n    return L'λ';\n}\n", language);
+            assert_eq!(old.structural_hash, same.structural_hash);
+            assert_eq!(old.structural_hash, formatted.structural_hash);
+            assert_eq!(
+                literals(&old)[0].structural_hash,
+                literals(&formatted)[0].structural_hash
+            );
+        }
+    }
+
+    #[test]
+    fn character_literal_payload_exceeds_sdk_capture_limit() {
+        let literal = format!("'{}b'", "a".repeat(4096));
+        let other = format!("'{}c'", "a".repeat(4096));
+        for language in ["c", "cpp"] {
+            let old = parse(&format!("int f() {{ return {literal}; }}"), language);
+            let new = parse(&format!("int f() {{ return {other}; }}"), language);
+            assert_eq!(literals(&old)[0].label, literal);
+            assert_ne!(old.structural_hash, new.structural_hash);
+        }
+    }
 
     #[test]
     fn grammar_id_nonempty() {
