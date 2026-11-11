@@ -100,6 +100,17 @@ const SEMANTIC_TYPES: &[&str] = &[
     "false",
     "null",
     "nullptr",
+    // Declaration qualifiers / specifiers (issue #4). Each is a leaf whose text is
+    // the keyword itself, so linkage, cv-qualification and C++ member/override
+    // contract edits are carried by an explicit token with its exact span instead
+    // of disappearing from the projection.
+    "storage_class_specifier",
+    "type_qualifier",
+    "explicit_function_specifier",
+    "virtual",
+    "virtual_specifier",
+    "ref_qualifier",
+    "noexcept",
     // Attributes (C++11)
     "attribute_declaration",
 ];
@@ -232,25 +243,51 @@ fn convert(
 
 use intentumdiff_plugin_sdk::ts_convert::{convert_semantic_classed, node_to_cst};
 
-// C/C++ character prefixes are anonymous grammar tokens. Make the literal an
-// atomic value so shared leaf hashing includes every source byte (including
-// prefixes and escapes), rather than only the named children. Read the original
-// span to bypass the SDK's bounded display-text capture.
-fn normalize_character_literals(
-    node: &mut CstNode,
-    original: tree_sitter::Node<'_>,
-    source: &[u8],
-) {
+/// Anonymous grammar keywords that carry declaration semantics. tree-sitter-cpp
+/// emits `virtual` as an unnamed token, so the shared named-only CST conversion
+/// would drop it entirely (issue #4); it is re-inserted as a keyword leaf.
+const ANONYMOUS_MODIFIERS: &[&str] = &["virtual"];
+
+fn keyword_leaf(node: tree_sitter::Node<'_>, source: &[u8]) -> CstNode {
+    CstNode {
+        node_type: node.kind().to_string(),
+        named: true,
+        text: Some(node.utf8_text(source).unwrap_or("").to_string()),
+        start_line: node.start_position().row as u32,
+        start_col: node.start_position().column as u32,
+        end_line: node.end_position().row as u32,
+        end_col: node.end_position().column as u32,
+        children: Vec::new(),
+    }
+}
+
+// Walk the shared named-only CST alongside the original tree:
+// - C/C++ character prefixes are anonymous grammar tokens. Make the literal an
+//   atomic value so shared leaf hashing includes every source byte (including
+//   prefixes and escapes), rather than only the named children. Read the
+//   original span to bypass the SDK's bounded display-text capture (issue #5).
+// - Re-insert semantic anonymous keywords (ANONYMOUS_MODIFIERS) in source order.
+fn normalize_cst(node: &mut CstNode, original: tree_sitter::Node<'_>, source: &[u8]) {
     if original.kind() == "char_literal" {
         node.text = Some(original.utf8_text(source).unwrap_or("").to_string());
         node.children.clear();
         return;
     }
-    for (index, child) in node.children.iter_mut().enumerate() {
-        if let Some(original_child) = original.named_child(index) {
-            normalize_character_literals(child, original_child, source);
+    let mut named = std::mem::take(&mut node.children).into_iter();
+    let mut children = Vec::new();
+    let mut cursor = original.walk();
+    for child in original.children(&mut cursor) {
+        if child.is_named() {
+            if let Some(mut converted) = named.next() {
+                normalize_cst(&mut converted, child, source);
+                children.push(converted);
+            }
+        } else if ANONYMOUS_MODIFIERS.contains(&child.kind()) {
+            children.push(keyword_leaf(child, source));
         }
     }
+    children.extend(named);
+    node.children = children;
 }
 
 fn is_c_language(language: &str, filename: &str) -> bool {
@@ -277,7 +314,7 @@ fn process_impl(source: &str, language: &str, filename: &str) -> String {
         None => return r#"{"error":"Parse failed"}"#.to_string(),
     };
     let mut root = node_to_cst(tree.root_node(), source.as_bytes());
-    normalize_character_literals(&mut root, tree.root_node(), source.as_bytes());
+    normalize_cst(&mut root, tree.root_node(), source.as_bytes());
     let mut memo: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
     let sem = match convert(&root, "0", None, &mut memo) {
         Some(n) => n,
@@ -455,6 +492,222 @@ mod tests {
             assert_eq!(literals(&old)[0].label, literal);
             assert_ne!(old.structural_hash, new.structural_hash);
         }
+    }
+
+    fn nodes_of<'a>(node: &'a SemanticNode, kind: &str, out: &mut Vec<&'a SemanticNode>) {
+        if node.node_type == kind {
+            out.push(node);
+        }
+        for child in &node.children {
+            nodes_of(child, kind, out);
+        }
+    }
+
+    fn find<'a>(node: &'a SemanticNode, kind: &str) -> Vec<&'a SemanticNode> {
+        let mut out = Vec::new();
+        nodes_of(node, kind, &mut out);
+        out
+    }
+
+    /// Assert `source` projects exactly one `kind` token labelled `keyword` whose
+    /// 0-based row / UTF-8 byte-column span selects `keyword` in the source.
+    fn assert_keyword(source: &str, language: &str, kind: &str, keyword: &str) {
+        let tree = parse(source, language);
+        let found = find(&tree, kind);
+        assert_eq!(found.len(), 1, "{language} {source:?}: {kind}");
+        let node = found[0];
+        assert_eq!(node.label, keyword, "{language} {source:?}");
+        assert!(node.children.is_empty());
+        let pos = &node.position;
+        assert_eq!(pos.start_line, pos.end_line);
+        let line = source.lines().nth(pos.start_line as usize).unwrap();
+        assert_eq!(
+            &line[pos.start_col as usize..pos.end_col as usize],
+            keyword,
+            "{language} {source:?}"
+        );
+    }
+
+    // Exact pairs from issue #4.
+    const ISSUE_4_PAIRS: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            "c",
+            "static int x=1;\n",
+            "int x=1;\n",
+            "storage_class_specifier",
+            "static",
+        ),
+        (
+            "c",
+            "volatile int x=1;\n",
+            "int x=1;\n",
+            "type_qualifier",
+            "volatile",
+        ),
+        (
+            "cpp",
+            "const int x=1;\n",
+            "int x=1;\n",
+            "type_qualifier",
+            "const",
+        ),
+    ];
+
+    #[test]
+    fn issue_4_qualifier_tokens_are_projected_with_exact_spans() {
+        for (language, old, new, kind, keyword) in ISSUE_4_PAIRS {
+            assert_keyword(old, language, kind, keyword);
+            let new_tree = parse(new, language);
+            assert!(find(&new_tree, kind).is_empty(), "{language} {new:?}");
+            let old_tree = parse(old, language);
+            assert_ne!(old_tree.structural_hash, new_tree.structural_hash);
+            assert_ne!(
+                serde_json::to_string(&old_tree.children).unwrap(),
+                serde_json::to_string(&new_tree.children)
+                    .unwrap()
+                    .replace("\"0.0.1", "\"0.0.2"),
+                "{language}: projections must differ beyond ids"
+            );
+            // Declaration identity is unchanged by the qualifier edit.
+            assert_eq!(old_tree.children[0].label, new_tree.children[0].label);
+        }
+    }
+
+    #[test]
+    fn issue_4_pairs_hold_in_both_dialects() {
+        for (_, old, new, kind, keyword) in ISSUE_4_PAIRS {
+            for language in ["c", "cpp"] {
+                assert_keyword(old, language, kind, keyword);
+                assert_ne!(
+                    parse(old, language).structural_hash,
+                    parse(new, language).structural_hash
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qualifier_identity_comment_and_formatting_controls_preserve_hashes() {
+        for (language, old, _, kind, keyword) in ISSUE_4_PAIRS {
+            let base = parse(old, language);
+            assert_eq!(
+                serde_json::to_string(&base).unwrap(),
+                serde_json::to_string(&parse(old, language)).unwrap()
+            );
+            let formatted = format!("  {keyword}   int\n x = 1 ;\n");
+            let commented = format!("/* note */ {keyword} int x=1; // trailing\n");
+            for variant in [formatted, commented] {
+                let other = parse(&variant, language);
+                // Comments are trivia: never projected. (The root hash covers the
+                // raw CST, so compare the declaration and the qualifier token.)
+                assert_eq!(other.children.len(), 1, "{variant:?}");
+                assert_eq!(
+                    base.children[0].structural_hash, other.children[0].structural_hash,
+                    "{variant:?}"
+                );
+                assert_eq!(
+                    find(&base, kind)[0].structural_hash,
+                    find(&other, kind)[0].structural_hash
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn more_storage_and_qualifier_keywords_are_projected() {
+        for language in ["c", "cpp"] {
+            for (source, kind, keyword) in [
+                ("extern int x;\n", "storage_class_specifier", "extern"),
+                (
+                    "inline int f(void) { return 1; }\n",
+                    "storage_class_specifier",
+                    "inline",
+                ),
+                (
+                    "int f(void) { register int r = 1; return r; }\n",
+                    "storage_class_specifier",
+                    "register",
+                ),
+                ("int * restrict p;\n", "type_qualifier", "restrict"),
+                ("void f(const char *s);\n", "type_qualifier", "const"),
+            ] {
+                assert_keyword(source, language, kind, keyword);
+            }
+        }
+        for (source, kind, keyword) in [
+            ("constexpr int x = 1;\n", "type_qualifier", "constexpr"),
+            (
+                "thread_local int x = 1;\n",
+                "storage_class_specifier",
+                "thread_local",
+            ),
+            (
+                "struct P { mutable int x; };\n",
+                "type_qualifier",
+                "mutable",
+            ),
+        ] {
+            assert_keyword(source, "cpp", kind, keyword);
+        }
+    }
+
+    #[test]
+    fn cpp_member_contract_keywords_are_projected_and_change_hashes() {
+        for (old, new, kind, keyword) in [
+            (
+                "struct P { int f() { return 1; } };\n",
+                "struct P { int f() const { return 1; } };\n",
+                "type_qualifier",
+                "const",
+            ),
+            (
+                "struct B { void f(); };\n",
+                "struct B { virtual void f(); };\n",
+                "virtual",
+                "virtual",
+            ),
+            (
+                "struct D : B { void f(); };\n",
+                "struct D : B { void f() override; };\n",
+                "virtual_specifier",
+                "override",
+            ),
+            (
+                "struct P { P(int); };\n",
+                "struct P { explicit P(int); };\n",
+                "explicit_function_specifier",
+                "explicit",
+            ),
+            (
+                "struct P { void f(); };\n",
+                "struct P { void f() &&; };\n",
+                "ref_qualifier",
+                "&&",
+            ),
+            (
+                "void f();\n",
+                "void f() noexcept;\n",
+                "noexcept",
+                "noexcept",
+            ),
+        ] {
+            assert_keyword(new, "cpp", kind, keyword);
+            assert!(find(&parse(old, "cpp"), kind).is_empty(), "{old:?}");
+            assert_ne!(
+                parse(old, "cpp").structural_hash,
+                parse(new, "cpp").structural_hash,
+                "{new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_keyword_keeps_member_identity_and_formatting_invariance() {
+        let base = parse("struct B { virtual void f(); };\n", "cpp");
+        let formatted = parse("struct B {\n    virtual\n    void f();\n};\n", "cpp");
+        assert_eq!(base.structural_hash, formatted.structural_hash);
+        let class = &base.children[0];
+        assert_eq!(class.label, "B");
     }
 
     #[test]
